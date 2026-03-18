@@ -1,0 +1,7 @@
+services:
+  manager:
+    build: ./server_manager
+    ports:
+      - "9999:9999/udp"
+    environment:
+      - PUBLIC_IP=${PUBLIC_IP}

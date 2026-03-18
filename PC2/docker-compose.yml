@@ -1,0 +1,10 @@
+services:
+  worker:
+    build: ./server
+    ports:
+      - "4433:4433/udp"
+      - "37025:37025/udp"
+      - "37026:37026/tcp"
+    environment:
+      - PUBLIC_IP=${PUBLIC_IP}
+      - MESH_PORT=37026
