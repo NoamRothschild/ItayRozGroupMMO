@@ -1,5 +1,10 @@
+*.tex linguist-vendored
+*.sty linguist-vendored
+*.cls linguist-vendored
+*.bib linguist-vendored
+*.aux linguist-vendored
+
 **/*.html linguist-vendored
-**/*.tex linguist-vendored
 
 *.py linguist-detectable=true
 Dockerfile linguist-detectable=true
