@@ -2,8 +2,10 @@ import asyncio
 import json
 import socket
 import time
+import aiosqlite
 import sqlite3
 import uuid
+import hashlib
 from aioquic.asyncio import serve
 from aioquic.asyncio.protocol import QuicConnectionProtocol
 from aioquic.quic.configuration import QuicConfiguration
@@ -13,6 +15,7 @@ from aioquic.quic.events import StreamDataReceived, ConnectionTerminated
 MANAGER_PORT = 9999
 BROADCAST_PORT = 37025
 ALPN = "manager-proto"
+SERVER_SECRET = "s3Rv-K3y!@2026x"  # Shared secret — servers must send this to register
 
 PLAYER_WIDTH = 37
 PLAYER_HEIGHT = 56
@@ -35,31 +38,40 @@ MESSAGE_QUEUE = None
 ONLINE_PLAYERS = []
 ONLINE_PLAYERS_IDS_INDEX = {}
 
-def init_db():
-    conn = sqlite3.connect('db.db')
-    c = conn.cursor()
-    # Unified table as requested
+async def init_db():
+    async with aiosqlite.connect("db.db") as conn:
+        await conn.execute("PRAGMA journal_mode=WAL;")
+        await conn.execute("PRAGMA busy_timeout = 5000;")
 
-    c.execute(f'''
-        CREATE TABLE IF NOT EXISTS players (
-            player_id TEXT PRIMARY KEY,
-            username TEXT,
-            password TEXT,
-            x INTEGER DEFAULT {-PLAYER_WIDTH//2},
-            y INTEGER DEFAULT {-PLAYER_HEIGHT//2},
-            hp INTEGER DEFAULT 100,
-            bow INTEGER DEFAULT 0,
-            heal INTEGER DEFAULT 0,
-            strength INTEGER DEFAULT 0,
-            shield INTEGER DEFAULT 0,
-            active_weapon_id INTEGER DEFAULT 9
-        )
-    ''')
-    conn.commit()
-    conn.close()
+        await conn.execute(f'''
+            CREATE TABLE IF NOT EXISTS players (
+                player_id TEXT PRIMARY KEY,
+                username TEXT,
+                password TEXT,
+                x INTEGER DEFAULT {-PLAYER_WIDTH//2},
+                y INTEGER DEFAULT {-PLAYER_HEIGHT//2},
+                hp INTEGER DEFAULT 100,
+                bow INTEGER DEFAULT 0,
+                heal INTEGER DEFAULT 0,
+                strength INTEGER DEFAULT 0,
+                shield INTEGER DEFAULT 0,
+                active_weapon_id INTEGER DEFAULT 9
+            )
+        ''')
+        await conn.commit()
 
     print("Database initialized")
 
+def db_read(query, params=()):
+    """Runs a read query in a separate thread to prevent blocking the async loop."""
+    with sqlite3.connect('db.db') as conn:
+        return conn.execute(query, params).fetchall()
+
+def db_write(query, params=()):
+    """Runs a write query in a separate thread."""
+    with sqlite3.connect('db.db') as conn:
+        conn.execute(query, params)
+        conn.commit()
 
 class ManagerProtocol(QuicConnectionProtocol):
     def __init__(self, *args, **kwargs):
@@ -131,6 +143,21 @@ def get_authoritative_server_for_chunk(x, y):
     return None
 
 
+def hash_password(password):
+    """
+    Triple-layered password hashing:
+      Layer 1 : SHA-256   (industry standard baseline)
+      Layer 2 : SHA3-512  (Keccak family – different algorithm family from SHA-2)
+      Layer 3 : BLAKE2b-512 (modern, competition winner, unrelated to SHA families)
+    Each layer feeds its hex-digest into the next, so cracking any single
+    algorithm is not enough to recover the original password.
+    """
+    layer1 = hashlib.sha256(password.encode()).hexdigest()
+    layer2 = hashlib.sha3_512(layer1.encode()).hexdigest()
+    layer3 = hashlib.blake2b(layer2.encode()).hexdigest()
+    return layer3
+
+
 def check_input(username, password):
     str_check = username + password
     bad_chars = [
@@ -145,122 +172,131 @@ def check_input(username, password):
     return True
 
 
-def handle_auth(username, password, mode):
-    conn = sqlite3.connect('db.db')
-    c = conn.cursor()
-
+async def handle_auth(username, password, mode):
     if not check_input(username, password):
         return {"success": False, "msg": "Invalid characters in input"}
 
-    if mode == "login":
-        c.execute(
-            """SELECT player_id, x, y, hp, bow, heal, strength, shield, active_weapon_id
-               FROM players
-               WHERE username=? AND password=?""",
-            (username, password)
-        )
-        row = c.fetchone()
-        conn.close()
+    async with aiosqlite.connect("db.db") as conn:
+        await conn.execute("PRAGMA busy_timeout = 5000;")
+        if mode == "login":
+            hashed_pw = hash_password(password)
+            async with conn.execute(
+                """SELECT player_id, x, y, hp, bow, heal, strength, shield, active_weapon_id
+                   FROM players
+                   WHERE username=? AND password=?""",
+                (username, hashed_pw)
+            ) as cursor:
+                row = await cursor.fetchone()
 
-        if row:
-            pid, x, y, hp, bow, heal, strength, shield, active_weapon_id = row
-            # Assign Server
-            best_conn = get_authoritative_server_for_chunk(x, y)
-            # Login Success: Return Server IP + Player Data
-            # For now, we default to local server. You can add load balancing logic here later.
-            if best_conn:
-                srv = ACTIVE_SERVERS[best_conn]
+            if row:
+                pid, x, y, hp, bow, heal, strength, shield, active_weapon_id = row
 
-                # 1. Generate a one-time reservation token
-                reservation_token = str(uuid.uuid4())
+                best_conn = get_authoritative_server_for_chunk(x, y)
 
-                payload = json.dumps({
-                    "type": "EXPECTED_PLAYER",
-                    "token": reservation_token,
-                    "pid": pid,
-                    "user": username,
-                    "x": x,
-                    "y": y,
-                    "hp": hp,
-                    "bow": bow,
-                    "heal": heal,
-                    "strength": strength,
-                    "shield": shield,
-                    "active_weapon_id": active_weapon_id
-                }).encode() + b'\n'
+                if best_conn:
+                    srv = ACTIVE_SERVERS[best_conn]
+                    reservation_token = str(uuid.uuid4())
 
-                ONLINE_PLAYERS.append((username, password))
-                ONLINE_PLAYERS_IDS_INDEX[pid] = (username, password)
+                    payload = json.dumps({
+                        "type": "EXPECTED_PLAYER",
+                        "token": reservation_token,
+                        "pid": pid,
+                        "user": username,
+                        "x": x,
+                        "y": y,
+                        "hp": hp,
+                        "bow": bow,
+                        "heal": heal,
+                        "strength": strength,
+                        "shield": shield,
+                        "active_weapon_id": active_weapon_id
+                    }).encode() + b'\n'
 
-                stream_id = best_conn._quic.get_next_available_stream_id()
-                best_conn._quic.send_stream_data(stream_id, payload, end_stream=True)
-                best_conn.transmit()
+                    ONLINE_PLAYERS.append((username, password))
+                    ONLINE_PLAYERS_IDS_INDEX[pid] = (username, password)
 
-                return {"success": True, "server_ip": srv["ip"], "server_port": srv["port"], "token": reservation_token}
-            else:
-                return {"success": False, "msg": "No server available for this region"}
-        else:
+                    stream_id = best_conn._quic.get_next_available_stream_id()
+                    best_conn._quic.send_stream_data(stream_id, payload, end_stream=True)
+                    best_conn.transmit()
+
+                    return {
+                        "success": True,
+                        "server_ip": srv["ip"],
+                        "server_port": srv["port"],
+                        "token": reservation_token
+                    }
+                else:
+                    return {"success": False, "msg": "No server available for this region"}
+
             return {"success": False, "msg": "Invalid Credentials"}
 
-    elif mode == "signup":
-        try:
-            x, y = -PLAYER_WIDTH // 2, -PLAYER_HEIGHT // 2
-            pid = str(uuid.uuid4())
-            c = conn.cursor()
-            c.execute("SELECT username,password FROM players")
-            rows = c.fetchall()
-            for row in rows:
-                if username == row[0]:
-                    conn.close()
+        elif mode == "signup":
+            try:
+                x, y = -PLAYER_WIDTH // 2, -PLAYER_HEIGHT // 2
+                pid = str(uuid.uuid4())
+
+                async with conn.execute(
+                    "SELECT username FROM players WHERE username=?",
+                    (username,)
+                ) as cursor:
+                    existing = await cursor.fetchone()
+
+                if existing:
                     return {"success": False, "msg": "Username already exists"}
 
-            c.execute(
-                """INSERT INTO players
-                   (player_id, username, password, x, y, hp, bow, heal, strength, shield, active_weapon_id)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (pid, username, password, x, y, 100, 0, 0, 0, 0, 9)
-            )
-            conn.commit()
-            conn.close()
+                hashed_pw = hash_password(password)
+                await conn.execute(
+                    """INSERT INTO players
+                       (player_id, username, password, x, y, hp, bow, heal, strength, shield, active_weapon_id)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (pid, username, hashed_pw, x, y, 100, 0, 0, 0, 0, 9)
+                )
+                await conn.commit()
+                await conn.close()
 
-            best_conn = get_authoritative_server_for_chunk(x, y)
-            if best_conn:
-                srv = ACTIVE_SERVERS[best_conn]
-                reservation_token = str(uuid.uuid4())
+                best_conn = get_authoritative_server_for_chunk(x, y)
+                if best_conn:
+                    srv = ACTIVE_SERVERS[best_conn]
+                    reservation_token = str(uuid.uuid4())
 
-                payload = json.dumps({
-                    "type": "EXPECTED_PLAYER",
-                    "token": reservation_token,
-                    "pid": pid,
-                    "user": username,
-                    "x": x,
-                    "y": y,
-                    "hp": 100,
-                    "bow": 0,
-                    "heal": 0,
-                    "strength": 0,
-                    "shield": 0,
-                    "active_weapon_id": 9
-                }).encode() + b'\n'
+                    payload = json.dumps({
+                        "type": "EXPECTED_PLAYER",
+                        "token": reservation_token,
+                        "pid": pid,
+                        "user": username,
+                        "x": x,
+                        "y": y,
+                        "hp": 100,
+                        "bow": 0,
+                        "heal": 0,
+                        "strength": 0,
+                        "shield": 0,
+                        "active_weapon_id": 9
+                    }).encode() + b'\n'
 
-                ONLINE_PLAYERS.append((username, password))
-                ONLINE_PLAYERS_IDS_INDEX[pid] = (username, password)
+                    ONLINE_PLAYERS.append((username, password))
+                    ONLINE_PLAYERS_IDS_INDEX[pid] = (username, password)
 
-                stream_id = best_conn._quic.get_next_available_stream_id()
-                best_conn._quic.send_stream_data(stream_id, payload, end_stream=True)
-                best_conn.transmit()
+                    stream_id = best_conn._quic.get_next_available_stream_id()
+                    best_conn._quic.send_stream_data(stream_id, payload, end_stream=True)
+                    best_conn.transmit()
 
-                return {"success": True, "server_ip": srv["ip"], "server_port": srv["port"], "token": reservation_token}
-            else:
-                return {"success": False, "msg": "Account Created, but no Servers Online."}
+                    return {
+                        "success": True,
+                        "server_ip": srv["ip"],
+                        "server_port": srv["port"],
+                        "token": reservation_token
+                    }
+                else:
+                    return {"success": False, "msg": "Account Created, but no Servers Online."}
 
-        except sqlite3.IntegrityError:
-            return {"success": False, "msg": "Username Taken"}
-        except Exception as e:
-            return {"success": False, "msg": str(e)}
-    else:
-        conn.close()
-        return {"success": False, "msg": "Error"}
+            except sqlite3.IntegrityError:
+                return {"success": False, "msg": "Username Taken"}
+            except Exception as e:
+                return {"success": False, "msg": str(e)}
+
+        else:
+            return {"success": False, "msg": "Error"}
 
 
 # Worker Task to process messages
@@ -273,17 +309,22 @@ async def packet_processor_worker():
         try:
             # HEAVY WORK happens here, off the main network thread
             msg = json.loads(data.decode())
-            handle_message(quic_conn, msg, sender_ip, stream_id)
+            await handle_message(quic_conn, msg, sender_ip, stream_id)
         except Exception as e:
-            print(f"[MANAGER] Error processing packet: {e} ")
+            print(f"[MANAGER] Error processing packet: {e}")
         finally:
             MESSAGE_QUEUE.task_done()
 
 
-def handle_message(client, msg, sender_ip, stream_id):
+async def handle_message(client, msg, sender_ip, stream_id):
     t = msg.get("type")
 
     if t == "SERVER_HELLO":
+        # Authenticate: server must provide the shared secret
+        if msg.get("secret") != SERVER_SECRET:
+            print(f"[MANAGER] REJECTED Server {sender_ip}: Invalid server secret.")
+            return
+
         if not UNASSIGNED_CHUNKS and not ACTIVE_SERVERS:
             print(f"[MANAGER] REJECTED Server {sender_ip}: Map is fully hosted.")
             return
@@ -348,15 +389,15 @@ def handle_message(client, msg, sender_ip, stream_id):
             ACTIVE_SERVERS[client]["last_seen"] = time.monotonic()
 
             players = msg.get("players", [])
-
-            for p in players:
-                pid_db = str(uuid.UUID(hex=p["player_id"]))
-                conn = sqlite3.connect("db.db")
-                c = conn.cursor()
-                c.execute("UPDATE players SET x=?, y=?, hp=? WHERE player_id=?",
-                          (p["x"], p["y"], p["hp"], pid_db))
-                conn.commit()
-                conn.close()
+            async with aiosqlite.connect("db.db") as conn:
+                await conn.execute("PRAGMA busy_timeout = 5000;")
+                for p in players:
+                    pid_db = str(uuid.UUID(hex=p["player_id"]))
+                    await conn.execute(
+                        "UPDATE players SET x=?, y=?, hp=? WHERE player_id=?",
+                        (p["x"], p["y"], p["hp"], pid_db)
+                    )
+                await conn.commit()
 
 
     elif t == "AUTH_REQUEST":
@@ -382,7 +423,19 @@ def handle_message(client, msg, sender_ip, stream_id):
             client.transmit()
             return
 
-        response = handle_auth(username, password, mode)
+        if len(username.strip()) == 0 or len(password) == 0:
+            response = {"success": False, "msg": "Username and password cannot be empty"}
+            client._quic.send_stream_data(stream_id, json.dumps(response).encode(), end_stream=True)
+            client.transmit()
+            return
+
+        if len(password) < 4:
+            response = {"success": False, "msg": "Password must be at least 4 characters"}
+            client._quic.send_stream_data(stream_id, json.dumps(response).encode(), end_stream=True)
+            client.transmit()
+            return
+
+        response = await handle_auth(username, password, mode)
 
         # Send result back to client
         client._quic.send_stream_data(stream_id, json.dumps(response).encode(), end_stream=True)
@@ -390,33 +443,31 @@ def handle_message(client, msg, sender_ip, stream_id):
 
 
     elif t == "PLAYER_LEFT":
+        if client not in ACTIVE_SERVERS:
+            return  # Only registered servers can report player disconnects
+
         pid_hex = msg["player_id"]
         x = msg.get("x")
         y = msg.get("y")
-        hp = msg.get("hp")
-        bow = msg.get("bow", 0)
-        heal = msg.get("heal", 0)
-        strength = msg.get("strength", 0)
-        shield = msg.get("shield", 0)
+        hp = max(0, min(100, msg.get("hp", 100)))
+        bow = 1 if msg.get("bow", 0) else 0
+        heal = 1 if msg.get("heal", 0) else 0
+        strength = 1 if msg.get("strength", 0) else 0
+        shield = 1 if msg.get("shield", 0) else 0
         active_weapon_id = msg.get("active_weapon_id", 9)
+        if active_weapon_id not in (1, 2, 3, 4, 5, 6, 9):
+            active_weapon_id = 9
 
         pid_db = str(uuid.UUID(hex=pid_hex))
-
-        conn = sqlite3.connect("db.db")
-        c = conn.cursor()
-        c.execute(
-
-            """UPDATE players
-               SET x=?, y=?, hp=?, bow=?, heal=?, strength=?, shield=?, active_weapon_id=?
-               WHERE player_id=?""",
-            (x, y, hp, bow, heal, strength, shield, active_weapon_id, pid_db)
-
-        )
-
-        conn.commit()
-        conn.close()
-
-        pid_db = str(uuid.UUID(hex=pid_hex))
+        async with aiosqlite.connect("db.db") as conn:
+            await conn.execute("PRAGMA busy_timeout = 5000;")
+            await conn.execute(
+                """UPDATE players
+                   SET x=?, y=?, hp=?, bow=?, heal=?, strength=?, shield=?, active_weapon_id=?
+                   WHERE player_id=?""",
+                (x, y, hp, bow, heal, strength, shield, active_weapon_id, pid_db)
+            )
+            await conn.commit()
         credentials = ONLINE_PLAYERS_IDS_INDEX.pop(pid_db, None)
         if credentials and credentials in ONLINE_PLAYERS:
             ONLINE_PLAYERS.remove(credentials)
@@ -448,14 +499,38 @@ async def send_heartbeats():
 
         await asyncio.sleep(6)
 
+def get_local_ip():
+    import os
+    # 1. Check if Docker passed in the IP via the environment variable first!
+    env_ip = os.environ.get("PUBLIC_IP")
+    if env_ip:
+        print(f"[SERVER] Using IP from Docker environment: {env_ip}")
+        return env_ip
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.connect(("8.8.8.8", 80))
+        ip = sock.getsockname()[0]
+        print(f"[SERVER] Detected local IP: {ip}")
+
+    except:
+        ip = "127.0.0.1"
+        print(f"[SERVER] Failed to detect IP, defaulting to: {ip}")
+    finally:
+        try:
+            sock.close()
+        except:
+            pass
+
+    return ip
 
 async def broadcast_presence_to_client():
     broadcast_port_client = 37022
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    sock.setblocking(False)
 
-    import os
-    public_ip = os.environ.get("PUBLIC_IP", "127.0.0.1")
+    public_ip = get_local_ip()
 
     msg = json.dumps({
         "service": "mm0Rgb-!#sErv-7",
@@ -479,8 +554,13 @@ async def broadcast_presence_to_client():
         for i in range(1, 255):
             try:
                 sock.sendto(msg, (f"{base_ip}{i}", broadcast_port_client))
+            except BlockingIOError:
+                pass  # Buffer is full, skip
             except Exception:
                 pass
+
+            if i % 10 == 0:
+                await asyncio.sleep(0)  # Let the async loop breathe!
         await asyncio.sleep(5)
 
 
@@ -488,8 +568,7 @@ async def broadcast_presence_to_server():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
 
-    import os
-    public_ip = os.environ.get("PUBLIC_IP", "127.0.0.1")
+    public_ip = get_local_ip()
 
     msg = json.dumps({
         "id": "MANAGER_QUIC_AUTH",
@@ -515,6 +594,9 @@ async def broadcast_presence_to_server():
                 sock.sendto(msg, (f"{base_ip}{i}", BROADCAST_PORT))
             except Exception:
                 pass
+
+            if i % 10 == 0:
+                await asyncio.sleep(0)  # Let the async loop breathe!
         await asyncio.sleep(5)
 
 
@@ -543,9 +625,12 @@ async def main():
         print("[MANAGER] Server stopped.")
 
 
+async def startup():
+    await init_db()
+    await main()
+
 if __name__ == "__main__":
-    init_db()  # Run on startup
     try:
-        asyncio.run(main())
+        asyncio.run(startup())
     except KeyboardInterrupt:
         pass

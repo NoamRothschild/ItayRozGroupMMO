@@ -44,7 +44,7 @@ SHOOT = 1 << 4
 SPRINT = 1 << 5
 CROUCH = 1 << 6
 
-DIR_MASK = UP | LEFT | DOWN | RIGHT | SHOOT
+DIR_MASK = UP | LEFT | DOWN | RIGHT
 
 MAP_WIDTH = 1920 * 40 # 76800 pixels
 MAP_HEIGHT = 1080 * 40 # 43200 pixels
@@ -97,6 +97,7 @@ CURRENT_PROCESS.cpu_percent() # Call it once to initialize the baseline
 CPU_USAGE = 0.0
 
 WAITING_ROOM = {}
+WAITING_ROOM_TTL = 30.0  # Tokens expire after 30 seconds
 
 # ===========================
 # MESH & DYNAMIC CHUNK GLOBALS
@@ -125,8 +126,8 @@ PEER_CONNECTIONS = {}  # { "SRV-ID": writer_object }
 PEER_INFO = {}  # { "SRV-ID": {"quic_ip": "...", "quic_port": ..., "chunks": [[x,y], ...]} }
 
 BACKGROUND_TASKS = set()
-
 ENEMIES_SPAWNED = False
+PENDING_OFFERS = set()
 
 class Weapon:
     def __init__(self, wid, name, kind, cooldown, damage, range1, bullet_speed = 0.0, bullet_lifetime = 0.0):
@@ -524,6 +525,7 @@ async def load_balancer_loop():
     """Monitors CPU. If overloaded, forces an idle server to take a chunk."""
     while True:
         await asyncio.sleep(5)  # Check load every 5 seconds
+        if not MY_CHUNKS: continue
 
         # If we are above 85% CPU, and we have chunks to spare
         if CPU_USAGE > 85.0 and len(MY_CHUNKS) > 1:
@@ -540,6 +542,12 @@ async def load_balancer_loop():
             if best_peer:
                 # Shed our most recently acquired chunk
                 chunk_to_shed = MY_CHUNKS[-1]
+                chunk_tuple = tuple(chunk_to_shed)
+                if chunk_tuple in PENDING_OFFERS:
+                    continue  # Skip, we already offered this one!
+
+                PENDING_OFFERS.add(chunk_tuple)
+
                 print(f"[LOAD BALANCER] CPU at {CPU_USAGE}%. Offering chunk {chunk_to_shed} to {best_peer}.")
 
                 payload = json.dumps({
@@ -553,6 +561,7 @@ async def load_balancer_loop():
                     if not writer.is_closing():
                         try:
                             writer.write(packet)
+                            create_bg_task(writer.drain())
                         except:
                             pass
 
@@ -594,6 +603,7 @@ def send_transfer_server_to_client(msg):
             if client.client_id and client.client_id.hex == pid:
                 try:
                     client._quic.send_stream_data(client.state_stream_id, packet, end_stream=True)
+                    client.transmit()
                 except: pass
 
                 # [FIXED] Clean, async-safe delayed close
@@ -604,6 +614,21 @@ def send_transfer_server_to_client(msg):
                     except: pass
 
                 create_bg_task(delayed_close(client))
+
+                destroy_msg = json.dumps({
+                    "type": "DESTROY_GHOST",
+                    "pid": pid
+                }).encode()
+                packet = struct.pack("!I", len(destroy_msg)) + destroy_msg
+
+                for w in PEER_CONNECTIONS.values():
+                    if not w.is_closing():
+                        try:
+                            w.write(packet)
+                            create_bg_task(w.drain())
+                        except:
+                            pass
+
                 break
     except Exception as e:
         print(f"[HANDOFF] Error sending jump packet: {e}")
@@ -634,7 +659,8 @@ def request_handoff_from_mesh(client, target_peer):
     if not writer or writer.is_closing():
         print(f"[MESH] Cannot route to {target_peer}, connection is closed.")
         PEER_CONNECTIONS.pop(target_peer, None)
-        client.handoff_in_progress = False  # <--- RESCUE THE CLIENT
+        client.handoff_in_progress = False
+        client.authenticated = True
         return
 
     try:
@@ -644,6 +670,7 @@ def request_handoff_from_mesh(client, target_peer):
         print(f"[MESH] Failed to send handoff to {target_peer}: {e}")
         PEER_CONNECTIONS.pop(target_peer, None)
         client.handoff_in_progress = False
+        client.authenticated = True
 
 
 def yield_stolen_chunks(peer_id, peer_chunks):
@@ -666,6 +693,21 @@ def yield_stolen_chunks(peer_id, peer_chunks):
             client.authenticated = False
             request_handoff_from_mesh(client, peer_id)
 
+    update_msg = json.dumps({
+        "type": "CHUNK_UPDATE",
+        "server_id": SERVER_SHORT_ID,
+        "chunks": MY_CHUNKS
+    }).encode()
+    packet = struct.pack("!I", len(update_msg)) + update_msg
+
+    for p_id, w in list(PEER_CONNECTIONS.items()):
+        if not w.is_closing():
+            try:
+                w.write(packet)
+                create_bg_task(w.drain())
+            except:
+                pass
+
 
 async def process_mesh_messages(reader, writer, peer_addr):
     peer_id_connected = None
@@ -679,6 +721,9 @@ async def process_mesh_messages(reader, writer, peer_addr):
             if not length_bytes: break
 
             length = struct.unpack("!I", length_bytes)[0]
+            if length > 65_536:  # 64 kb max limit
+                print("[MESH] Security dropped massive packet!")
+                break
 
             try:
                 data = await reader.readexactly(length)
@@ -690,6 +735,9 @@ async def process_mesh_messages(reader, writer, peer_addr):
 
                 if msg["type"] == "MESH_HELLO":
                     peer_id_connected = msg["server_id"]
+
+                    if peer_id_connected == SERVER_SHORT_ID: continue
+
                     PEER_CONNECTIONS[peer_id_connected] = writer
 
                     peer_chunks = msg.get("chunks", [])
@@ -700,6 +748,22 @@ async def process_mesh_messages(reader, writer, peer_addr):
                     }
                     print(f"[MESH] Active peer {peer_id_connected} joined. Total peers: {len(PEER_CONNECTIONS)}")
                     yield_stolen_chunks(peer_id_connected, peer_chunks)
+
+                    if not msg.get("is_reply"):
+                        reply_msg = {
+                            "type": "MESH_HELLO",
+                            "server_id": SERVER_SHORT_ID,
+                            "quic_ip": get_local_ip(),
+                            "quic_port": QUIC_PORT,
+                            "chunks": MY_CHUNKS,
+                            "is_reply": True  # This prevents an infinite loop of hellos!
+                        }
+                        payload = json.dumps(reply_msg).encode()
+                        try:
+                            writer.write(struct.pack("!I", len(payload)) + payload)
+                            await writer.drain()
+                        except Exception as e:
+                            print(f"[MESH] Failed to send hello reply: {e}")
 
                 elif msg["type"] == "CHUNK_UPDATE":
                     p_id = msg["server_id"]
@@ -720,10 +784,11 @@ async def process_mesh_messages(reader, writer, peer_addr):
                             "y": ghost["y"],
                             "hp": ghost["hp"],
                             "dir": ghost["dir"],
+                            "wid": ghost["wid"],
                             "last_updated": time.monotonic()
                         }
 
-                        payload = struct.pack("!B16sfffB", 1, pid.bytes, ghost["x"], ghost["y"], ghost["hp"], ghost["dir"])
+                        payload = struct.pack("!B16sfffBB", 1, pid.bytes, ghost["x"], ghost["y"], ghost["hp"], ghost["dir"], ghost["wid"])
                         packet = struct.pack("!H", len(payload)) + payload
 
                         for client in list(CONNECTED_CLIENTS):
@@ -780,6 +845,7 @@ async def process_mesh_messages(reader, writer, peer_addr):
                             "strength": msg.get("strength", 0),
                             "shield": msg.get("shield", 0),
                             "active_weapon_id": msg.get("active_weapon_id", 9),
+                            "created": time.monotonic(),
                         }
                         reply = {
                             "type": "HANDOFF_ACCEPTED",
@@ -795,9 +861,64 @@ async def process_mesh_messages(reader, writer, peer_addr):
                                 await writer.drain()
                             except:
                                 print("[MESH] Failed to write to server")
+                    else:
+                        # NEW: Reject the handoff so the player isn't stuck in limbo!
+                        reply = {
+                            "type": "HANDOFF_REJECTED",
+                            "pid": msg["pid"]
+                        }
+                        payload = json.dumps(reply).encode()
+                        if not writer.is_closing():
+                            try:
+                                writer.write(struct.pack("!I", len(payload)) + payload)
+                                await writer.drain()
+                            except:
+                                pass
 
                 elif msg["type"] == "HANDOFF_ACCEPTED":
                     send_transfer_server_to_client(msg)
+
+                elif msg["type"] == "CHAT":
+                    username = msg["username"]
+                    msg = msg["raw_msg"].encode()
+
+                    create_bg_task(broadcast_ghost_message(msg, username))
+
+                elif msg["type"] == "HANDOFF_REJECTED":
+                    pid_hex = msg["pid"]
+                    for client in list(CONNECTED_CLIENTS):
+                        if client.client_id and client.client_id.hex == pid_hex:
+                            print(f"[HANDOFF] Target rejected {client.user_name}. Aborting jump.")
+                            client.authenticated = True  # Give controls back!
+                            client.handoff_in_progress = False  # Unlock handoff state
+                            break
+
+                elif msg["type"] == "DESTROY_GHOST":
+                    target_pid_hex = msg["pid"]
+                    target_uuid = uuid.UUID(hex=target_pid_hex)
+
+                    # Remove from our shadow dictionary
+                    SHADOW_PLAYERS.pop(target_uuid, None)
+
+                    is_real_player_here = False
+                    for client in list(CONNECTED_CLIENTS):
+                        if getattr(client, 'authenticated', False) and client.client_id == target_uuid:
+                            is_real_player_here = True
+                            break
+
+                    if is_real_player_here:
+                        # They just seamlessly jumped to us. Ignore Server A's cleanup packet!
+                        continue
+
+                    # Tell all our local clients to delete the sprite
+                    payload = struct.pack("!B16s", 3, target_uuid.bytes)
+                    packet = struct.pack("!H", len(payload)) + payload
+                    for client in list(CONNECTED_CLIENTS):
+                        if getattr(client, 'authenticated', False):
+                            try:
+                                client._quic.send_stream_data(client.state_stream_id, packet, end_stream=False)
+                            except:
+                                pass
 
             except Exception as e:
                 # IF THE MESSAGE CRASHES, WE CATCH IT HERE!
@@ -823,6 +944,27 @@ async def process_mesh_messages(reader, writer, peer_addr):
             print(f"[MESH] Peer {peer_id_connected} left. Total peers: {len(PEER_CONNECTIONS)}")
 
 
+async def broadcast_ghost_message(msg, username):
+    user_bytes = username.encode()
+    payload = (struct.pack(
+        "!BII",
+        9,
+        len(user_bytes),
+        len(msg),
+    )
+    + user_bytes
+    + msg
+    )
+
+    packet = struct.pack("!H", len(payload)) + payload
+
+    for client in list(CONNECTED_CLIENTS):
+        try:
+            client._quic.send_stream_data(client.control_stream_id, packet, end_stream=False)
+        except:
+            pass
+
+
 async def handle_server_peer(reader, writer):
     peer_addr = writer.get_extra_info('peername')
     await process_mesh_messages(reader, writer, peer_addr)
@@ -836,6 +978,10 @@ async def start_backend_mesh():
 
 
 async def connect_to_peer(peer_id, ip, port):
+    if peer_id < SERVER_SHORT_ID: return
+
+    if peer_id == SERVER_SHORT_ID: return
+
     if peer_id in PEER_CONNECTIONS: return
     try:
         reader, writer = await asyncio.open_connection(ip, int(port))
@@ -866,7 +1012,7 @@ async def server_to_server_sync():
             if getattr(client, 'authenticated', False) and client.client_id:
                 ghosts.append({
                     "pid": client.client_id.hex,
-                    "x": client.x, "y": client.y, "hp": client.hp, "dir": client.dir
+                    "x": client.x, "y": client.y, "hp": client.hp, "dir": client.dir, "wid": getattr(client, "active_weapon_id", 0)
                 })
 
         # [REPLACED] We send GHOST_SYNC even if empty, just to transmit our CPU load!
@@ -956,6 +1102,7 @@ class ManagerClientProtocol(QuicConnectionProtocol):
                             "strength": msg.get("strength", 0),
                             "shield": msg.get("shield", 0),
                             "active_weapon_id": msg.get("active_weapon_id", 9),
+                            "created": time.monotonic(),
                         }
                         print(f"[SERVER] Expecting player {msg['user']} with token {token[:8]}...")
 
@@ -987,14 +1134,28 @@ class ManagerClientProtocol(QuicConnectionProtocol):
             os._exit(0)
 
 def get_local_ip():
+    # 1. Check if Docker passed in the IP via the environment variable first!
+    env_ip = os.environ.get("PUBLIC_IP")
+    if env_ip:
+        print(f"[SERVER] Using IP from Docker environment: {env_ip}")
+        return env_ip
+
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         sock.connect(("8.8.8.8", 80))
         ip = sock.getsockname()[0]
         print(f"[SERVER] Detected local IP: {ip}")
-        return ip
+
+    except:
+        ip = "127.0.0.1"
+        print(f"[SERVER] Failed to detect IP, defaulting to: {ip}")
     finally:
-        sock.close()
+        try:
+            sock.close()
+        except:
+            pass
+
+    return ip
 
 
 async def find_manager():
@@ -1046,16 +1207,15 @@ async def connect_to_manager():
         MANAGER_STREAM_ID = client._quic.get_next_available_stream_id(False)
 
         # ---- SERVER HELLO (ONCE) ----
-        public_ip = os.environ.get("PUBLIC_IP")
-        if not public_ip:
-            public_ip = get_local_ip()
+        public_ip = get_local_ip()
 
         send_to_manager({
             "type": "SERVER_HELLO",
             "id": SERVER_SHORT_ID,
             "port": 4433,
             "public_ip": public_ip,
-            "mesh_port": BACKEND_PORT
+            "mesh_port": BACKEND_PORT,
+            "secret": "s3Rv-K3y!@2026x"
         })
 
         # ---- SNAPSHOT LOOP (HEARTBEAT) ----
@@ -1121,7 +1281,6 @@ class Bullet:
 # QUIC GAME SERVER
 # ===========================
 
-
 class GameServerProtocol(QuicConnectionProtocol):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -1153,13 +1312,13 @@ class GameServerProtocol(QuicConnectionProtocol):
         self.last_dir_y = 0.0
 
         self.inventory = [
-            WEAPONS_BY_ID[WEAPON_PISTOL],  # slot 0
-            WEAPONS_BY_ID[WEAPON_KNIFE],  # slot 1
+            self._make_weapon(WEAPON_PISTOL),  # slot 0
+            self._make_weapon(WEAPON_KNIFE),   # slot 1
             None,  # slot 2 = bow
             None,  # slot 3 = heal
             None,  # slot 4 = strength
             None,  # slot 5 = shield
-            WEAPONS_BY_ID[HAND]  # slot 6 = hands
+            self._make_weapon(HAND)            # slot 6 = hands
         ]
 
         self.active_weapon = self.inventory[6]
@@ -1195,6 +1354,24 @@ class GameServerProtocol(QuicConnectionProtocol):
         self.handoff_in_progress = False
         self.joined_server_time = time.monotonic()
 
+        self.packets_this_second = 0
+        self.last_packet_time = time.time()
+
+    @staticmethod
+    def _make_weapon(wid):
+        """Create a fresh per-player copy of a weapon so globals are never mutated."""
+        template = WEAPONS_BY_ID[wid]
+        return Weapon(
+            wid=template.wid,
+            name=template.name,
+            kind=template.kind,
+            cooldown=template.cooldown,
+            damage=template.damage,
+            range1=template.range,
+            bullet_speed=template.bullet_speed,
+            bullet_lifetime=template.bullet_lifetime,
+        )
+
     def pick_new_bot_move(self):
         x = int(time.time() * 1000) + id(self)
 
@@ -1220,6 +1397,16 @@ class GameServerProtocol(QuicConnectionProtocol):
         elif isinstance(event, ConnectionTerminated):
             print(f"QUIC connection closed by client.")
             self.connection_loss()
+
+        current_time = time.time()
+        if current_time - self.last_packet_time >= 1.0:
+            self.packets_this_second = 0
+            self.last_packet_time = current_time
+
+        self.packets_this_second += 1
+
+        if self.packets_this_second > 60:  # Allow max 60 packets per second (matches 60 FPS tick rate)
+            return  # Silently drop the spam!
 
     async def handle_handshake(self):
         print("Client connected")
@@ -1264,13 +1451,20 @@ class GameServerProtocol(QuicConnectionProtocol):
 
             msg_len = struct.unpack("!H", buffer[:2])[0]
 
+            if msg_len == 0:
+                del buffer[:2]  # Discard the zero-length header
+                continue
+
             if len(buffer) < 2 + msg_len:
                 return
 
             payload = buffer[2:2 + msg_len]
             del buffer[:2 + msg_len]
 
-            self.handle_message(payload)
+            try:
+                self.handle_message(payload)
+            except Exception:
+                pass  # Don't let a malformed packet crash the connection
 
 
     def handle_message(self, data):
@@ -1286,7 +1480,7 @@ class GameServerProtocol(QuicConnectionProtocol):
             self.last_packet_time = now
 
         self.packet_count += 1
-        if self.packet_count > 6000:
+        if self.packet_count > 60:
             return  # Drop the packet if they exceed 60 per second
 
         msg_type = data[0]  # We use binary protocol. The first byte is the message type
@@ -1300,6 +1494,9 @@ class GameServerProtocol(QuicConnectionProtocol):
         elif msg_type == 1:
             intent, seq = struct.unpack("!BH", data[1:])
 
+            # Sanitize: only allow valid flag bits (0-6)
+            intent = intent & (UP | LEFT | DOWN | RIGHT | SHOOT | SPRINT | CROUCH)
+
             self.last_seq = seq
             self.current_intent = intent
 
@@ -1309,11 +1506,34 @@ class GameServerProtocol(QuicConnectionProtocol):
             self.current_intent = intent & ~SHOOT
 
         elif msg_type == 2:
-            length = struct.unpack("!I", data[1:5])[0]
-            if length > 256:
+            if len(data) < 5:
                 return
+            length = struct.unpack("!I", data[1:5])[0]
+            if length > 256 or length == 0:
+                return
+            if len(data) < 5 + length:
+                return  # Client lied about the length
             message = data[5:5 + length]
             self.broadcast_message(message)
+
+            try:
+                chat_payload = json.dumps({
+                    "type": "CHAT",
+                    "raw_msg": message.decode(),
+                    "username": self.user_name
+                }).encode()
+
+                packet = struct.pack("!I", len(chat_payload)) + chat_payload
+
+                for peer_id, w in list(PEER_CONNECTIONS.items()):
+                    if not w.is_closing():
+                        try:
+                            w.write(packet)
+                        except Exception:
+                            pass
+            except Exception as e:
+                print(f"Failed to forward chat: {e}")
+
 
         elif msg_type == 5:
             self.last_heartbeat = time.time()
@@ -1327,23 +1547,17 @@ class GameServerProtocol(QuicConnectionProtocol):
             slot_index = struct.unpack("!B", data[1:2])[0]
 
             if 0 <= slot_index < len(self.inventory):
-                self.active_weapon = self.inventory[slot_index]
+                weapon = self.inventory[slot_index]
+                if weapon is None:
+                    return  # Can't switch to an empty slot
+                self.active_weapon = weapon
                 self.active_weapon_id = self.active_weapon.wid
                 self.broadcast_weapon_update(self.active_weapon_id)
 
-        elif msg_type == MSG_HEAL:
-            if self.active_weapon==self.inventory[2]:
-                if self.hp<90:
-                    self.hp += 10
-                else:
-                    self.hp = 100
-                self.send_hp_update()
-                self.broadcast_hp_update()
-
-        elif msg_type == MSG_STRENGTH:
-            if self.active_weapon==self.inventory[3]:
-                PISTOL.set_damage(15)
-                KNIFE.set_damage(30)
+        # MSG_HEAL and MSG_STRENGTH are intentionally NOT handled here.
+        # Healing and strength are processed through the authoritative
+        # spell() path in change_pos() which properly validates the active
+        # weapon, applies cooldowns, and CONSUMES the item from inventory.
 
         elif msg_type == MSG_TOGGLE_BOT:
             self.bot_mode = not self.bot_mode
@@ -1362,22 +1576,27 @@ class GameServerProtocol(QuicConnectionProtocol):
 
             token_bytes = data[1:]
             token = token_bytes.decode()
-            print(token)
 
             if token in WAITING_ROOM:
                 user_data = WAITING_ROOM.pop(token)
+
+                # Reject expired tokens
+                if time.monotonic() - user_data.get("created", 0) > WAITING_ROOM_TTL:
+                    print("Expired token rejected")
+                    self._quic.close()
+                    return
 
                 self.client_id = user_data["pid"]
                 self.user_name = user_data["user"]
                 self.hp = user_data["hp"]
                 self.inventory = [
-                    WEAPONS_BY_ID[WEAPON_PISTOL],  # slot 0
-                    WEAPONS_BY_ID[WEAPON_KNIFE],  # slot 1
-                    WEAPONS_BY_ID[WEAPON_BOW] if user_data.get("bow", 0) else None,
-                    WEAPONS_BY_ID[HEAL] if user_data.get("heal", 0) else None,
-                    WEAPONS_BY_ID[STRENGTH] if user_data.get("strength", 0) else None,
-                    WEAPONS_BY_ID[SHIELD] if user_data.get("shield", 0) else None,
-                    WEAPONS_BY_ID[HAND]  # slot 6
+                    self._make_weapon(WEAPON_PISTOL),  # slot 0
+                    self._make_weapon(WEAPON_KNIFE),   # slot 1
+                    self._make_weapon(WEAPON_BOW) if user_data.get("bow", 0) else None,
+                    self._make_weapon(HEAL) if user_data.get("heal", 0) else None,
+                    self._make_weapon(STRENGTH) if user_data.get("strength", 0) else None,
+                    self._make_weapon(SHIELD) if user_data.get("shield", 0) else None,
+                    self._make_weapon(HAND)  # slot 6
                 ]
 
                 self.current_intent = user_data.get("intent", 0)
@@ -1503,7 +1722,7 @@ class GameServerProtocol(QuicConnectionProtocol):
             return
 
         if self.inventory[slot_index] is None:
-            self.inventory[slot_index] = drop_weapon
+            self.inventory[slot_index] = self._make_weapon(drop_weapon.wid)
             self.send_inventory_state()
 
     def get_weapon_damage(self, w: Weapon):
@@ -1566,9 +1785,9 @@ class GameServerProtocol(QuicConnectionProtocol):
                 break
 
     def spell(self, w: Weapon):
-        global strength_start_time, strength_active
-
         if w.name == "heal":
+            if self.inventory[3] is None:
+                return  # Already consumed
             if self.hp < 90:
                 self.hp += 10
             else:
@@ -1585,6 +1804,8 @@ class GameServerProtocol(QuicConnectionProtocol):
 
 
         elif w.name == "strength":
+            if self.inventory[4] is None:
+                return  # Already consumed
             self.strength_active = True
             self.strength_start_time = time.monotonic()
             self.inventory[4] = None
@@ -1594,6 +1815,8 @@ class GameServerProtocol(QuicConnectionProtocol):
             self.send_inventory_state()
 
         elif w.name == "shield":
+            if self.inventory[5] is None:
+                return  # Already consumed
             self.shield_active = True
             self.shield_start_time = time.monotonic()
 
@@ -1606,7 +1829,6 @@ class GameServerProtocol(QuicConnectionProtocol):
 
 
     def change_pos(self, intent):
-        global LAVA_DAMAGE
         dir_x = 0
         dir_y = 0
 
@@ -1630,16 +1852,6 @@ class GameServerProtocol(QuicConnectionProtocol):
             now = time.monotonic()
             w = self.active_weapon
 
-
-            if now - w.last_time_use > w.cooldown:
-                if w.kind=="strength":
-                    PISTOL.set_damage(10)
-                    KNIFE.set_damage(20)
-                if w.kind=="shield":
-                    LAVA_DAMAGE=2.5
-                w.last_time_use = 0
-
-            w.last_time_use = now
 
             if now - self.last_weapon_use < w.cooldown:
                 return
@@ -1843,7 +2055,7 @@ class GameServerProtocol(QuicConnectionProtocol):
     # ===========================
 
     def broadcast_world_state(self):
-        payload = struct.pack("!B16sfffB", 1, self.client_id.bytes, self.x, self.y, self.hp, self.dir)
+        payload = struct.pack("!B16sfffBB", 1, self.client_id.bytes, self.x, self.y, self.hp, self.dir, self.active_weapon_id)
         packet = struct.pack("!H", len(payload)) + payload
 
         # 2. Send it to EVERYONE ELSE
@@ -2025,6 +2237,20 @@ def player_would_collide(x, y):
 # ===========================
 # BACKGROUND TASKS
 # ===========================
+async def cleanup_waiting_room():
+    """Removes dead handoff tokens if a player fails to connect within 15 seconds."""
+    while True:
+        await asyncio.sleep(10)
+        now = time.monotonic()
+        dead_tokens = [
+            token for token, data in WAITING_ROOM.items()
+            if now - data["created"] > 15.0
+        ]
+        for t in dead_tokens:
+            WAITING_ROOM.pop(t, None)
+            print(f"[HANDOFF] Cleared expired token {t} from waiting room.")
+
+
 async def manager_connector_loop():
     while True:
         try:
@@ -2073,7 +2299,7 @@ async def bullets_tick():
 
 
 async def server_movement_tick():
-    global CPU_USAGE, shield_active, shield_duration, shield_start_time, strength_start_time, strength_active, shield_duration, LAVA_DAMAGE
+    global CPU_USAGE
     accumulator = 0.0
     last_time = time.perf_counter()
     sync_tick = 0
@@ -2135,7 +2361,7 @@ async def server_movement_tick():
 
                 # NORMAL PLAYER MOVEMENT
                 else:
-                    is_moving = bool(current & (UP | LEFT | DOWN | RIGHT))
+                    is_moving = bool(current & DIR_MASK)
                     should_process = is_moving or client.shoot_pending
 
                     if should_process:
@@ -2240,6 +2466,7 @@ async def start_server():
     create_bg_task(check_tile())
     create_bg_task(bullets_tick())
     create_bg_task(enemy_loop())
+    create_bg_task(cleanup_waiting_room())
 
     # Mesh Background Tasks
     create_bg_task(start_backend_mesh())
