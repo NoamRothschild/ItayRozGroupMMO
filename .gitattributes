@@ -1,5 +1,5 @@
-*.html linguist-detectable=false
-*.tex linguist-detectable=false
+**/*.html linguist-vendored
+**/*.tex linguist-vendored
 
 *.py linguist-detectable=true
 Dockerfile linguist-detectable=true
