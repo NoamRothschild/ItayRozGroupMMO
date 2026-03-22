@@ -1,10 +1,20 @@
-*.tex linguist-detectable=false
-*.sty linguist-detectable=false
-*.cls linguist-detectable=false
-*.bib linguist-detectable=false
-*.aux linguist-detectable=false
+**/*.tex -linguist-detectable
+**/*.sty -linguist-detectable
+**/*.cls -linguist-detectable
+**/*.bib -linguist-detectable
+**/*.aux -linguist-detectable
+**/*.bbl -linguist-detectable
+**/*.blg -linguist-detectable
+**/*.log -linguist-detectable
+**/*.out -linguist-detectable
+**/*.toc -linguist-detectable
+**/*.fdb_latexmk -linguist-detectable
+**/*.fls -linguist-detectable
+**/*.synctex.gz -linguist-detectable
 
-**/*.html linguist-detectable=false
+**/*.html -linguist-detectable
+**/*.htm -linguist-detectable
 
-*.py linguist-detectable=true
-Dockerfile linguist-detectable=true
+**/*.py linguist-detectable
+Dockerfile linguist-detectable
+**/Dockerfile linguist-detectable
